@@ -170,9 +170,7 @@ def max_dim(inp, dim=None, keepdim=False):
         out_value = out_value.squeeze(dim)
         out_index = out_index.squeeze(dim)
 
-    # 手动固定块大小，避免 libtuner 冷启动开销（确保性能稳定）
-    BLOCK_M = 64
-    grid = (triton.cdiv(M, BLOCK_M),)
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
 
     with torch_device_fn.device(inp.device):
         max_dim_kernel[grid](
