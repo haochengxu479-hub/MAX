@@ -32,10 +32,10 @@ logger = logging.getLogger(__name__)
 @libentry()
 @triton.jit
 def max_kernel_1(
-    inp,  #所有数字压成一排
-    mid,#一个空数组，用来存放每个小组找出来的最大值（长度 = 小组数量）
-    M, #总共有多少个数字
-    BLOCK_SIZE: tl.constexpr, #每个小组负责看几个数字
+    inp,
+    mid,
+    M,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -81,7 +81,7 @@ def max_kernel(
 ):
     # set offset
     pid_m = ext.program_id(0)
-    m_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)#这组负责处理 BLOCK_M 行的行号
+    m_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
     dtype = inp.type.element_ty
     acc_type = tl.float32 if dtype is tl.bfloat16 else dtype
@@ -107,7 +107,78 @@ def max_kernel(
     tl.store(out_value_ptrs, result_value, mask=mask1)
     tl.store(out_index_ptrs, result_index, mask=mask1)
 
-'''
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("naive_reduction"),
+    key=["M", "N"],
+)
+@triton.jit
+def max_kernel_1_strided_3d(
+    inp,
+    out_value,
+    out_index,
+    M,
+    N,
+    s0: tl.constexpr,
+    s1: tl.constexpr,
+    s2: tl.constexpr,
+    t0: tl.constexpr,
+    t1: tl.constexpr,
+    t2: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = ext.program_id(0)
+    m_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+    n_offset = tl.arange(0, BLOCK_N)
+
+    dtype = inp.type.element_ty
+    acc_type = tl.float32 if dtype is tl.bfloat16 else dtype
+    min_value = get_dtype_min(dtype)
+
+    result_value = tl.full([BLOCK_M], value=min_value, dtype=acc_type)
+    result_index = tl.zeros([BLOCK_M], dtype=tl.int64)
+
+    if dim == 0:
+        # output shape: [1, s1, s2], flattened as [s1, s2]
+        i1 = m_offset // s2
+        i2 = m_offset % s2
+        base_offset = i1 * t1 + i2 * t2
+        reduce_stride = t0
+    elif dim == 1:
+        # output shape: [s0, 1, s2], flattened as [s0, s2]
+        i0 = m_offset // s2
+        i2 = m_offset % s2
+        base_offset = i0 * t0 + i2 * t2
+        reduce_stride = t1
+    else:
+        # dim == 2
+        # output shape: [s0, s1, 1], flattened as [s0, s1]
+        i0 = m_offset // s1
+        i1 = m_offset % s1
+        base_offset = i0 * t0 + i1 * t1
+        reduce_stride = t2
+
+    for i in range(0, N, BLOCK_N):
+        cur_n = i + n_offset
+        inp_offsets = base_offset[:, None] + cur_n[None, :] * reduce_stride
+
+        mask = (m_offset[:, None] < M) & (cur_n[None, :] < N)
+        inp_vals = tl.load(inp + inp_offsets, mask=mask, other=min_value)
+
+        max_value, max_index = tl.max(inp_vals, axis=1, return_indices=True)
+
+        update_mask = max_value > result_value
+        result_value = tl.where(update_mask, max_value, result_value)
+        result_index = tl.where(update_mask, i + max_index, result_index)
+
+    mask_m = m_offset < M
+    tl.store(out_value + m_offset, result_value, mask=mask_m)
+    tl.store(out_index + m_offset, result_index, mask=mask_m)
+
+
 def max(inp):
     logger.debug("GEMS MAX")
     inp = inp.contiguous()
@@ -124,132 +195,69 @@ def max(inp):
         max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
         max_kernel_2[(1, 1, 1)](mid, out, mid_size, block_mid)
     return out
-'''
-
-@libentry()
-@triton.jit
-def max_kernel_1_strided_3d(
-    inp,
-    mid,
-    M,
-    S0: tl.constexpr,
-    S1: tl.constexpr,
-    S2: tl.constexpr,
-    T0: tl.constexpr,
-    T1: tl.constexpr,
-    T2: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    linear = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = linear < M
-
-    i0 = linear // (S1 * S2)
-    rem = linear - i0 * (S1 * S2)
-    i1 = rem // S2
-    i2 = rem - i1 * S2
-
-    real_offset = i0 * T0 + i1 * T1 + i2 * T2
-
-    min_value = get_dtype_min(inp.type.element_ty)
-    inp_val = tl.load(inp + real_offset, mask=mask, other=min_value)
-    max_val = tl.max(inp_val)
-    tl.store(mid + pid, max_val)
-
-@libentry()
-@triton.jit
-def max_kernel_1_strided_2d(
-    inp,
-    mid,
-    M,
-    S0: tl.constexpr,
-    S1: tl.constexpr,
-    T0: tl.constexpr,
-    T1: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    linear = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = linear < M
-
-    i0 = linear // S1
-    i1 = linear - i0 * S1
-
-    real_offset = i0 * T0 + i1 * T1
-
-    min_value = get_dtype_min(inp.type.element_ty)
-    inp_val = tl.load(inp + real_offset, mask=mask, other=min_value)
-    max_val = tl.max(inp_val)
-    tl.store(mid + pid, max_val)
-
-
-
-def max(inp):
-    logger.debug("GEMS MAX")
-  
-    M = inp.numel()
-
-    block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
-    mid_size = triton.cdiv(M, block_size)
-    block_mid = triton.next_power_of_2(mid_size)
-
-    dtype = inp.dtype
-    mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
-    out = torch.empty([], dtype=dtype, device=inp.device)
-
-    with torch_device_fn.device(inp.device):
-        
-        
-        if inp.ndim == 3:
-                    s0, s1, s2 = inp.shape
-                    t0, t1, t2 = inp.stride()
-                    max_kernel_1_strided_3d[(mid_size, 1, 1)](
-                        inp,
-                        mid,
-                        M,
-                        s0,
-                        s1,
-                        s2,
-                        t0,
-                        t1,
-                        t2,
-                        block_size,
-                    )
-        elif inp.is_contiguous():
-            max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
-        
-        else:
-            inp = inp.contiguous()
-            max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
-
-        max_kernel_2[(1, 1, 1)](mid, out, mid_size, block_mid)
-
-    return out
 
 
 def max_dim(inp, dim=None, keepdim=False):
     logger.debug("GEMS MAX DIM")
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
     shape = list(inp.shape)
-    dim = dim % inp.ndim  #处理负数索引（比如 -1 自动变成最后一维）
- 
-    inp = dim_compress(inp, dim)
- 
-    N = shape[dim]
-    shape[dim] = 1
-    M = inp.numel() // N
+    dim = dim % inp.ndim
+    #==========================================================
     
+    origin_ndim = inp.ndim#用这个
+    if origin_ndim == 3:
+        N = shape[dim]
+        shape[dim] = 1
+        M = inp.numel() // N
 
-    out_value = torch.empty(shape, dtype=inp.dtype, device=inp.device)
-    out_index = torch.empty(shape, dtype=torch.int64, device=inp.device)
+        out_value = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        out_index = torch.empty(shape, dtype=torch.int64, device=inp.device)
 
-    if not keepdim:
-        out_value = torch.squeeze(out_value, dim)
-        out_index = torch.squeeze(out_index, dim)
+        if not keepdim:
+            out_value = torch.squeeze(out_value, dim)
+            out_index = torch.squeeze(out_index, dim)
 
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-    with torch_device_fn.device(inp.device):
-        max_kernel[grid](inp, out_value, out_index, M, N)
-    Max_out = namedtuple("max", ["values", "indices"])
-    out = Max_out(values=out_value, indices=out_index)
-    return out
+        s0, s1, s2 = inp.shape
+        t0, t1, t2 = inp.stride()
+
+        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+
+        with torch_device_fn.device(inp.device):
+            max_kernel_1_strided_3d[grid](
+                inp,
+                out_value,
+                out_index,
+                M,
+                N,
+                s0,
+                s1,
+                s2,
+                t0,
+                t1,
+                t2,
+                dim,
+            )
+
+        Max_out = namedtuple("max", ["values", "indices"])
+        out = Max_out(values=out_value, indices=out_index)
+        return out
+    else:
+
+        inp = dim_compress(inp, dim)
+        N = shape[dim]
+        shape[dim] = 1
+        M = inp.numel() // N
+
+        out_value = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        out_index = torch.empty(shape, dtype=torch.int64, device=inp.device)
+
+        if not keepdim:
+            out_value = torch.squeeze(out_value, dim)
+            out_index = torch.squeeze(out_index, dim)
+
+        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+        with torch_device_fn.device(inp.device):
+            max_kernel[grid](inp, out_value, out_index, M, N)
+        Max_out = namedtuple("max", ["values", "indices"])
+        out = Max_out(values=out_value, indices=out_index)
+        return out
