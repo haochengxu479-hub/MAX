@@ -92,16 +92,13 @@ def max_kernel(
         n_offset = i + tl.arange(0, BLOCK_N)
         offset = m_offset[:, None] * N + n_offset[None, :]
         # set mask
-        mask = (m_offset[:, None] < M) & (n_offset[None, :] < N)
+        mask = m_offset[:, None] < M and n_offset[None, :] < N
         inp_ptrs = inp + offset
         inp_vals = tl.load(inp_ptrs, mask=mask, other=min_value)
-        max_value = tl.max(inp_vals, axis=1).to(acc_type)
-        index_mask = mask & (inp_vals == max_value[:, None])
-        index_vals = tl.where(index_mask, n_offset[None, :], N)
-        max_index = tl.min(index_vals, axis=1)
+        max_value, max_index = tl.max(inp_vals, axis=1, return_indices=True)
         update_mask = max_value > result_value
         result_value = tl.where(update_mask, max_value, result_value)
-        result_index = tl.where(update_mask, max_index, result_index)
+        result_index = tl.where(update_mask, i + max_index, result_index)
     mask1 = m_offset < M
     offset_index = m_offset
     out_value_ptrs = out_value + offset_index
@@ -110,7 +107,7 @@ def max_kernel(
     tl.store(out_value_ptrs, result_value, mask=mask1)
     tl.store(out_index_ptrs, result_index, mask=mask1)
 
-
+'''
 def max(inp):
     logger.debug("GEMS MAX")
     inp = inp.contiguous()
@@ -126,6 +123,104 @@ def max(inp):
     with torch_device_fn.device(inp.device):
         max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
         max_kernel_2[(1, 1, 1)](mid, out, mid_size, block_mid)
+    return out
+'''
+
+@libentry()
+@triton.jit
+def max_kernel_1_strided_3d(
+    inp,
+    mid,
+    M,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+    T0: tl.constexpr,
+    T1: tl.constexpr,
+    T2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    linear = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = linear < M
+
+    i0 = linear // (S1 * S2)
+    rem = linear - i0 * (S1 * S2)
+    i1 = rem // S2
+    i2 = rem - i1 * S2
+
+    real_offset = i0 * T0 + i1 * T1 + i2 * T2
+
+    min_value = get_dtype_min(inp.type.element_ty)
+    inp_val = tl.load(inp + real_offset, mask=mask, other=min_value)
+    max_val = tl.max(inp_val)
+    tl.store(mid + pid, max_val)
+
+@libentry()
+@triton.jit
+def max_kernel_1_strided_2d(
+    inp,
+    mid,
+    M,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    T0: tl.constexpr,
+    T1: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    linear = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = linear < M
+
+    i0 = linear // S1
+    i1 = linear - i0 * S1
+
+    real_offset = i0 * T0 + i1 * T1
+
+    min_value = get_dtype_min(inp.type.element_ty)
+    inp_val = tl.load(inp + real_offset, mask=mask, other=min_value)
+    max_val = tl.max(inp_val)
+    tl.store(mid + pid, max_val)
+
+
+
+def max(inp):
+    logger.debug("GEMS MAX")
+
+    M = inp.numel()
+
+    block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+    mid_size = triton.cdiv(M, block_size)
+    block_mid = triton.next_power_of_2(mid_size)
+
+    dtype = inp.dtype
+    mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
+    out = torch.empty([], dtype=dtype, device=inp.device)
+
+    with torch_device_fn.device(inp.device):
+        if inp.is_contiguous():
+            max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
+        elif inp.ndim == 3:
+            s0, s1, s2 = inp.shape
+            t0, t1, t2 = inp.stride()
+            max_kernel_1_strided_3d[(mid_size, 1, 1)](
+                inp,
+                mid,
+                M,
+                s0,
+                s1,
+                s2,
+                t0,
+                t1,
+                t2,
+                block_size,
+            )
+        else:
+            inp = inp.contiguous()
+            max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
+
+        max_kernel_2[(1, 1, 1)](mid, out, mid_size, block_mid)
+
     return out
 
 
