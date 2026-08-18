@@ -199,7 +199,7 @@ def max(inp):
 
     with torch_device_fn.device(inp.device):
         
-        print(f"[flag_gems.max] inp.ndim: {inp.ndim}", flush=True)
+        
         if inp.ndim == 3:
                     s0, s1, s2 = inp.shape
                     t0, t1, t2 = inp.stride()
