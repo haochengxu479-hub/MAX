@@ -186,7 +186,7 @@ def max_kernel_1_strided_2d(
 
 def max(inp):
     logger.debug("GEMS MAX")
-
+  
     M = inp.numel()
 
     block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
@@ -198,23 +198,26 @@ def max(inp):
     out = torch.empty([], dtype=dtype, device=inp.device)
 
     with torch_device_fn.device(inp.device):
-        if inp.is_contiguous():
+        
+        print(f"[flag_gems.max] inp.ndim: {inp.ndim}", flush=True)
+        if inp.ndim == 3:
+                    s0, s1, s2 = inp.shape
+                    t0, t1, t2 = inp.stride()
+                    max_kernel_1_strided_3d[(mid_size, 1, 1)](
+                        inp,
+                        mid,
+                        M,
+                        s0,
+                        s1,
+                        s2,
+                        t0,
+                        t1,
+                        t2,
+                        block_size,
+                    )
+        elif inp.is_contiguous():
             max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
-        elif inp.ndim == 3:
-            s0, s1, s2 = inp.shape
-            t0, t1, t2 = inp.stride()
-            max_kernel_1_strided_3d[(mid_size, 1, 1)](
-                inp,
-                mid,
-                M,
-                s0,
-                s1,
-                s2,
-                t0,
-                t1,
-                t2,
-                block_size,
-            )
+        
         else:
             inp = inp.contiguous()
             max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size)
@@ -229,10 +232,13 @@ def max_dim(inp, dim=None, keepdim=False):
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
     shape = list(inp.shape)
     dim = dim % inp.ndim  #处理负数索引（比如 -1 自动变成最后一维）
+ 
     inp = dim_compress(inp, dim)
+ 
     N = shape[dim]
     shape[dim] = 1
     M = inp.numel() // N
+    
 
     out_value = torch.empty(shape, dtype=inp.dtype, device=inp.device)
     out_index = torch.empty(shape, dtype=torch.int64, device=inp.device)
