@@ -205,6 +205,15 @@ def max_dim(inp, dim=None, keepdim=False):
     #==========================================================
     
     origin_ndim = inp.ndim#用这个
+    '''
+    print("inp.shape:", inp.shape)
+    print("inp.ndim:", inp.ndim)
+    print("dim:", dim)
+    print("dim size:", inp.shape[dim])
+    raise RuntimeError(
+        f"entered max_dim: shape={tuple(inp.shape)}, ndim={inp.ndim}, dim={dim}"
+    )
+    '''
     if origin_ndim == 3:
         N = shape[dim]
         shape[dim] = 1
